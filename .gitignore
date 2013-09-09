@@ -1,6 +1,15 @@
 *.class
-
+*~
+*.diff
+*#
 # Package Files #
+.classpath
+.project
+.settings
+bin/.settings
+.eclipse
+*/bin
+target
 *.jar
 *.war
 *.ear
