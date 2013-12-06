@@ -28,6 +28,7 @@ public class CheckDone implements Runnable{
     
     private RollIdent ident;
     private boolean firstFlag;
+    private boolean tried = false;
     public CheckDone (RollIdent ident) {
         this.ident = ident;
         this.firstFlag = true;
@@ -42,30 +43,61 @@ public class CheckDone implements Runnable{
     public void run() {
         Calendar calendar = Calendar.getInstance();
         long nowTS = calendar.getTimeInMillis();
-//        long nowTS = new Date(1376913788000l).getTime();
+        List<String> attemptSource = new ArrayList<String>();
         while (ident.ts <= Util.getPrevWholeTs(nowTS, ident.period)) {
             LOG.info("Handling app " + ident.app + ", roll ts " + new Date(ident.ts).toString());
+            attemptSource.clear();
             if (!wasDone(ident)) {
-                List<Path> dfsPathes = getRollHdfsPath(ident);
-                try {
-                    for (Path expectedFile : dfsPathes) {
-                        if (!retryExists(expectedFile)) {
-                            LOG.info("File " + expectedFile + " not ready.");
-                            throw new IOException();
+                Path expectedFile = null;
+                for(String source : ident.sources) {
+                    expectedFile = getRollHdfsPath(ident, source);
+                    if (!retryExists(expectedFile)) {
+                        LOG.info("File " + expectedFile + " not ready.");
+                        attemptSource.add(source);
+                    }
+                }
+                if (attemptSource.isEmpty()) {
+                    if (expectedFile != null) {
+                        if (!retryTouch(expectedFile.getParent())) {
+                            LOG.warn("Failed to touch a done file. Try in next check cycle.");
+                            break;
                         }
+                        firstFlag = false;
+                    } else {
+                        LOG.fatal("expectedFile is null. It should not be happen.");
                     }
-                    if (!retryTouch(dfsPathes.get(0).getParent())) {
-                        LOG.warn("Failed to touch a done file. Try in next check cycle.");
-                        break;
-                    }
-                    firstFlag = false;
-                } catch (IOException e) {
+                } else {
                     if (!firstFlag && calendar.get(Calendar.MINUTE) >= alartTime) {
-                        LOG.error("Alarm, too long to finish.");
+                        if (!tried) {
+                            LOG.error("Alarm, too long to finish. Attempt to recovery using blackhole cli once.");
+                            Runtime runtime = Runtime.getRuntime();
+                            tried = true;
+                            for (String source : attemptSource) {
+                                String[] cmdarray = new String[3];
+                                cmdarray[0] = "sh";
+                                cmdarray[1] = blackholeBinPath + "/cli.sh";
+                                cmdarray[2] = "auto recovery " + ident.app + " " + source + " " + ident.ts;
+                                try {
+                                    LOG.info("run command: " + cmdarray[0] + " " + cmdarray[1] + " " + cmdarray[2]);
+                                    runtime.exec(cmdarray);
+                                } catch (IOException e1) {
+                                    LOG.error("Alarm, recovery attempt fail.");
+                                }
+                                try {
+                                    Thread.sleep(20000);
+                                } catch (InterruptedException e) {
+                                    LOG.error(e.getMessage());
+                                }
+                            }
+                            break;
+                        }
+                    } else {
+                        break;
                     }
                 }
             }
             ident.ts = Util.getNextWholeTs(ident.ts, ident.period);
+            tried = false;
         }
     }
     
@@ -82,16 +114,12 @@ public class CheckDone implements Runnable{
      * hdfsbasedir/appname/2013-11-01/14/08/machine01@appname_2013-11-01.14.08.gz.tmp
      * hdfsbasedir/appname/2013-11-01/14/08/machine02@appname_2013-11-01.14.08.gz.tmp
      */
-    public List<Path> getRollHdfsPath (RollIdent ident) {
-        List<Path> fileList = new ArrayList<Path>();
+    public Path getRollHdfsPath (RollIdent ident, String source) {
         String format  = Util.getFormatFromPeroid(ident.period);
         Date roll = new Date(ident.ts);
         SimpleDateFormat dm= new SimpleDateFormat(format);
-        for (String source : ident.sources) {
-            fileList.add(new Path(hdfsbasedir + '/' + ident.app + '/' + Util.getDatepathbyFormat(dm.format(roll)) + 
-                    source + '@' + ident.app + "_" + dm.format(roll) + hdfsfilesuffix));
-        }
-        return fileList;
+        return new Path(hdfsbasedir + '/' + ident.app + '/' + Util.getDatepathbyFormat(dm.format(roll)) + 
+                    source + '@' + ident.app + "_" + dm.format(roll) + hdfsfilesuffix);
     }
     
     public boolean retryExists(Path expected) {
@@ -168,6 +196,10 @@ public class CheckDone implements Runnable{
         String keytab = prop.getProperty("KEYTAB_FILE");
         String namenodePrincipal = prop.getProperty("NAMENODE.PRINCIPAL");
         String principal = prop.getProperty("PRINCIPAL");
+        blackholeBinPath = prop.getProperty("BLACKHOLE_BIN");
+        if (blackholeBinPath.endsWith("/")) {
+            blackholeBinPath = blackholeBinPath.substring(0, blackholeBinPath.length() - 1);
+        }
         Configuration conf = new Configuration();
         conf.set("checkdone.keytab", keytab);
         conf.set("dfs.namenode.kerberos.principal", namenodePrincipal);
@@ -200,6 +232,10 @@ public class CheckDone implements Runnable{
                 }
                 sources.add(host);
             }
+            if (sources.isEmpty()) {
+                LOG.error("source hosts are all miss.");
+                System.exit(0);
+            }
             rollIdent.sources = sources;
             rollIdent.period = Long.parseLong(prop.getProperty(appName + ".ROLL_PERIOD"));
             rollIdent.ts = Long.parseLong(prop.getProperty(appName + ".BEGIN_TS", "1356969600000"));
@@ -211,6 +247,7 @@ public class CheckDone implements Runnable{
     private static final String DONE_FLAG = "_done";
     private static String hdfsbasedir;
     private static String hdfsfilesuffix;
+    private static String blackholeBinPath;
     private static FileSystem fs;
     private static final int REPEATE = 3;
     private static final int RETRY_SLEEP_TIME = 1000;
